@@ -309,6 +309,107 @@ class CandidateScenarios(unittest.TestCase):
         self.assertEqual(action['drop'], 1)
         self.assertEqual(action['fire'], [False, False])
 
+    def test_loot_checks_all_exit_headings_without_relaxing_cover(self):
+        barricades = (box(56.4, 56.8, -8., 8., top=2.), box(59., 61., 3.7, 4.2, top=2.),
+                      box(59., 61., -4.2, -3.7, top=2.))
+        cover = (box(55.6, 57., 3., 6.7),)
+        for label, start, walls, enemies, expected in (
+            ('blocked inward exits', 69., barricades, [], True),
+            ('only a lateral exit is covered', 70., cover, [foe(1, 30., 0., yaw=0.)], True),
+            ('no covered exit', 70., (), [foe(1, 30., 0., yaw=0.)], False),
+        ):
+            with self.subTest(label=label):
+                self.write_map(*walls)
+                bot = Bot(self.hello)
+                o = obs_at(pos=(start, 0., 0.), aim=(0. if enemies else math.pi, 0.))
+                o['pickups'] = [{'id': 8000, 'kind': 'laser', 'pos': [60., 0., 0.]}]
+                o['mechs'] = enemies
+                action = bot.act(o)
+                if expected:
+                    self.assertLess(action['move'][0], -.9)
+                    o['self']['pos'] = (63., 0., 0.)
+                    o.update(t=.6, tick=12)
+                    self.assertEqual(bot.act(o).get('take'), 8000)
+                else:
+                    self.assertGreaterEqual(action['move'][0], 0.)
+
+    def test_search_exits_a_traversable_pocket_between_compass_headings(self):
+        for degrees, half_width, length in ((18., 4.25, 21.), (-61., 4.4, 25.)):
+            with self.subTest(degrees=degrees):
+                yaw = math.radians(degrees)
+                c, s = math.cos(yaw), math.sin(yaw)
+                walls = [box(-12., length, half_width, half_width + 7.),
+                         box(-12., length + 4., -half_width - 7., -half_width),
+                         box(-13., -5., -half_width - 7., half_width + 7.)]
+                for wall in walls:
+                    coordinates = iter(wall['ring'])
+                    wall['ring'] = [v for x, y in zip(coordinates, coordinates) for v in (c*x - s*y, s*x + c*y)]
+                self.write_map(*walls)
+                action = Bot(self.hello).act(obs_at(5., aim=(yaw, 0.)))
+                self.assertGreater(action['move'][0] * c + action['move'][1] * s, .9)
+
+    def test_escape_takes_a_checked_detour_when_straight_exit_stalls(self):
+        yaw = math.pi / 8
+        c, s = math.cos(yaw), math.sin(yaw)
+        avenue = [box(-14., 11., -7., -4.7), box(-14., 11., 4.7, 7.)]
+        for wall in avenue:
+            xy = iter(wall['ring'])
+            wall['ring'] = [v for x, y in zip(xy, xy) for v in (c*x - s*y, s*x + c*y)]
+        courtyard = [box(-19., -17., -8., 7.), box(13., 15., -8., 7.), box(-19., 15., -8., -6.),
+                     box(-19., 3.5, 5., 7.), box(11.5, 15., 5., 7.)]
+        for label, walls, source in (
+            ('offset gate', courtyard, (-9., 0.)),
+            ('skewed avenue', avenue, (-8*c - 2.15*s, -8*s + 2.15*c)),
+        ):
+            with self.subTest(label=label):
+                self.write_map(*walls)
+                o = obs_at()
+                o['self']['hp'] = 590.
+                o['mechs'] = [foe(4, *source, yaw=math.atan2(-source[1], -source[0]))]
+                o['events'] = [{'type': 'damaged', 'weapon': 'gun', 'amount': 45, 'by': 4,
+                                'bearing': math.atan2(source[1], source[0])}]
+                bot = Bot(self.hello)
+                self.assertGreater(bot.act(o)['move'][0], .8)
+                o.update(t=.4, tick=8, events=[])
+                o['self']['pos'] = (5.3, .9, 0.)
+                self.assertGreater(bot.act(o)['move'][1], .5)
+
+    def test_urgent_duel_shorts_charging_laser_without_turning(self):
+        for rotation in (False, True):
+            source = (4., 3.) if rotation else (27., 0.)
+            pos = (33., 0., 0.) if rotation else (0., 0., 0.)
+            dx, dy = source[0] - pos[0], source[1] - pos[1]
+            yaw = math.atan2(dy, dx)
+            o = obs_at(365. if rotation else 341., pos=pos, alive=2,
+                       aim=(yaw, math.atan2(-2.5, math.hypot(dx, dy))))
+            o['zone'].update(radius=43. if rotation else 70., next_radius=25.,
+                             shrink_start=350., shrink_end=375., dps=160.)
+            o['self'].update(hp=790. if rotation else 265., energy=85.)
+            o['self']['weapons'] = [weapon('gun', cooldown=.19 if rotation else 0.), weapon('lightning')]
+            actor = foe(1, *source, hp=1100., yaw=math.atan2(-dy, -dx), charging=True)
+            actor['weapons'] = ['gun', 'laser']
+            o['mechs'] = [actor]
+            if rotation:
+                self.write_map(box(13., 24., -10., -5.))
+            else:
+                self.write_map(box(5., 8., 4., 15.))
+                o['events'] = [{'type': 'damaged', 'weapon': 'gun', 'amount': 45., 'by': 1, 'bearing': 0.}]
+            with self.subTest(rotation=rotation):
+                action = Bot(self.hello).act(o)
+                self.assertEqual(action['fire'], [not rotation, True])
+                for veto in ('not charging', 'interceptor', 'late cooldown', 'low reserve'):
+                    with self.subTest(veto=veto):
+                        v = deepcopy(o)
+                        if veto == 'not charging':
+                            v['mechs'][0]['charging'] = False
+                        elif veto == 'interceptor':
+                            v['crates'] = [{'id': 1000, 'pos': [pos[0] + .35*dx, pos[1] + .35*dy, 0.], 'hp': 300.}]
+                        elif veto == 'late cooldown':
+                            v['self']['weapons'][1]['cooldown'] = .09
+                        else:
+                            v['self']['energy'] = 29.5 if rotation else 30.5
+                        self.assertFalse(Bot(self.hello).act(v)['fire'][1])
+
     def test_zero_radius_and_skipped_ticks_choose_inward(self):
         self.write_map()
         bot = Bot(self.hello)

@@ -1,6 +1,6 @@
 """Mech Royale policy: acquire power, leave an exit, convert in the last circle."""
 from dataclasses import dataclass
-from math import atan2, cos, hypot, pi, sin
+from math import atan2, ceil, cos, hypot, pi, sin
 from time import perf_counter
 
 import mechfight
@@ -40,6 +40,7 @@ class Intent:
     acquire: float = 0.
     path: list | None = None
     roof: tuple | None = None
+    detour: bool = False
 
     @property
     def key(self):
@@ -115,10 +116,19 @@ class Bot:
         aim, target = self._target(duel, ahead)
         critical = self.rush or self.unsafe or self.intent.kind == 'escape'
         move, boost, jump = self._move(target, critical)
-        action = self.weapons.act(obs, target, urgent=critical or self.pinched, reserve=self.reserve, aim=aim)
+        urgent = critical or self.pinched
+        interrupt = duel and urgent and self.intent.kind in ('escape', 'rotate')
+        reserve = self.reserve
+        if interrupt and boost:
+            drain = 'boost_drain' if self.me['grounded'] and not jump else 'jet_drain'
+            reserve += self.stats[drain] * self.weapons.window
+        action = self.weapons.act(obs, target, urgent=urgent, reserve=reserve, aim=aim, interrupt=interrupt)
         action.update(tick=obs['tick'], move=move, boost=boost, jump=jump)
-        if target and any(w and (not f and w.get('charge', 0.) > 0. if w['kind'] == 'laser' else f)
-                          for w, f in zip(self.me['weapons'], action['fire'])):
+        # A defensive lightning interrupt is not a pursuit cue.
+        if target and any(
+                w and (not f and w.get('charge', 0.) > 0. if w['kind'] == 'laser'
+                       else f and not (interrupt and w['kind'] == 'lightning'))
+                for w, f in zip(self.me['weapons'], action['fire'])):
             self.shot_target, self.shot_at, self.shot_origin = target, self.t, self.p
         self._equip(action, critical)
         if (target is None and not critical and not self.pinched and obs['alive'] > 1
@@ -302,9 +312,25 @@ class Bot:
             if perf_counter() > self.stop_work and candidates:
                 break
         point = max(candidates, default=(0., self.p if not rotate else desired), key=lambda row: row[0])[1]
+        if mode == 'search' and distance(self.p, point) < .9 and not self.dangers:
+            point = self._search_step()
         self.anchor_key, self.anchor_point = key, point
         self.anchor_until = self.t + (.48 if rotate else .9)
         return point
+
+    def _search_step(self):
+        # The fixed compass ring can miss a traversable doorway or narrow lane.
+        yaw = self.me['aim'][0]
+        for reach in (15., 5.):
+            for turn_index in (0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8):
+                if perf_counter() >= self.stop_work:
+                    return self.p
+                q = self._ground(offset(self.p, yaw + turn_index * pi / 8, reach))
+                if (self.zone.margin(q, reach / self.speed + 3.) >= 0
+                        and self._walk(self.p, q)
+                        and not ((self.enemies or self.npcs) and self._lines(q, .45))):
+                    return q
+        return self.p
 
     def _cover(self, q):
         if self.main:
@@ -448,7 +474,7 @@ class Bot:
         if self._cover(p) and self.zone.margin(p, elapsed + 3.) >= 0:
             candidates.append(p)
         candidates.sort(key=lambda n: self.zone.margin(n, elapsed + distance(p, n) / self.speed + 3.), reverse=True)
-        for n in candidates[:5]:
+        for n in candidates:
             if perf_counter() > self.stop_work:
                 break
             eta = distance(p, n) / self.speed
@@ -518,6 +544,65 @@ class Bot:
             return self.intent
         return Intent(kind, p, item=item, path=self._route(self.p, p, priority=kind == 'rotate'))
 
+    def _escape_intent(self):
+        single_line = len(self.dangers) == 1 and self.main is not None
+        old = self.intent
+        if old and old.detour:
+            if single_line and old.path and self.stalled < 1.4 and self._safe_escape_path(old.path):
+                return old
+            self.anchor_key = self.intent = None
+        goal = self._anchor('escape')
+        if not single_line or distance(self.p, goal) >= 1.4:
+            return self._route_intent('escape', goal)
+
+        source = self.main['pos']
+        yaw = angle(source, self.p) if self.next_margin >= 8 else angle(self.p, self.zone.next)
+        exits = [self._ground(offset(self.p, yaw, 17.)), *self.arena.neighbors(self.p, 15., self.r, self.h)]
+        covered = []
+        for q in exits:
+            if perf_counter() >= self.stop_work:
+                break
+            d = distance(self.p, q)
+            if (self.zone.margin(q, d / self.speed + 3.) >= 0 and self.arena.fits(q, self.r, self.h)
+                    and not self._line(self.main, q) and not self._lines(q, .45)):
+                m = min(self.zone.next_margin(q), 33., self.zone.next_radius * .48)
+                covered.append((.36 * m + .85 * min(d, 15.) + .58 * distance(source, q) - .12 * d, q))
+        covered.sort(reverse=True)
+        for _, q in covered[:2]:
+            path = self._route(self.p, q)
+            if path and self._safe_escape_path(path):
+                return Intent('escape', q, path=path, detour=True)
+        return self._route_intent('escape', goal)
+
+    def _safe_escape_path(self, path):
+        end = path[-1]
+        eta, harm = self.zone.travel(self.p, path, self.speed, slack=3.)
+        if (eta > 3. or harm or self.zone.margin(end, eta + 3.) < 0
+                or self._line(self.main, end) or self._lines(end, .45)):
+            return False
+        source = self.main['pos']
+        closest_allowed = max(self.r * 2, distance(self.p, source) - self.r)
+        a = self.p
+        for b in path:
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            length = hypot(dx, dy)
+            if length:
+                f = max(0., min(1., ((source[0] - a[0]) * dx + (source[1] - a[1]) * dy) / length**2))
+                if distance((a[0] + f * dx, a[1] + f * dy), source) < closest_allowed:
+                    return False
+                samples = ceil(length / 4.)
+                for k in range(1, samples):
+                    if perf_counter() >= self.stop_work:
+                        return False
+                    f = k / samples
+                    q = a[0] + f * dx, a[1] + f * dy, a[2] + f * (b[2] - a[2])
+                    if any(e['id'] != self.main['id'] for e in self._lines(q, .45)):
+                        return False
+            if any(e['id'] != self.main['id'] for e in self._lines(b, .45)):
+                return False
+            a = b
+        return True
+
     def _advantage(self, foe):
         hp = foe.get('hp')
         value = 0. if hp is None else (self.me['hp'] - hp) / self.me['max_hp']
@@ -552,7 +637,7 @@ class Bot:
                 if contested or danger or self.pinched:
                     self.drop_abort[drop['id']] = self.t + 5.
                     if self.margin >= 0 and not self.rush:
-                        self.intent = self._route_intent('escape', self._anchor('escape'))
+                        self.intent = self._escape_intent()
                         return
         if old and old.roof and self.climbing and not (self.rush or self.unsafe):
             return
@@ -560,7 +645,7 @@ class Bot:
             self.intent = self._route_intent('rotate', self._anchor('rotate'))
             return
         if self.unsafe:
-            self.intent = self._route_intent('escape', self._anchor('escape'))
+            self.intent = self._escape_intent()
             return
         if old and old.kind == 'pursue' and self.pursuit and self.t < self.pursuit[1]:
             if distance(self.p, old.p) > 2. and self.stalled < 1.2 and self.zone.margin(old.p, 3.) >= 0:

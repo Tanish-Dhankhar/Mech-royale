@@ -399,7 +399,7 @@ class Weapons:
         return track, False
 
     def act(self, obs: dict, target: dict | None, *, urgent: bool, reserve: float,
-            aim: tuple[float, float] | None = None) -> dict:
+            aim: tuple[float, float] | None = None, interrupt: bool = False) -> dict:
         now = obs.get("t", obs.get("tick", 0) * self.dt)
         if any(event.get("type") == "effect" and event.get("effect") == "short" for event in obs.get("events", ())):
             self.short_until = max(self.short_until, now + self.rules["lightning"]["short_s"])
@@ -426,7 +426,9 @@ class Weapons:
             for entity in obs.get("crates", ())
         )
         body = self._body(target, "crate" if crate else None)
-        if urgent and (body.kind == "crate" or gun is None):
+        counter = (weapons.get("lightning") if interrupt and urgent and body.kind == "mech"
+                   and target.get("charging") and "laser" in target.get("weapons", ()) else None)
+        if urgent and (body.kind == "crate" or (gun is None and counter is None)):
             return action
         others = [
             self._body(entity, kind)
@@ -451,6 +453,11 @@ class Weapons:
                 fire[gun[0]] = True
             elif gun_hit:
                 action["aim"], fire[gun[0]] = command, True
+            # Short a pending release without retargeting or interrupting movement.
+            if (counter and self._delay(counter[1]["cooldown"]) == self.dt
+                    and self._lightning(counter, pose, action["aim"], body, others,
+                                        own.get("energy", 0.0) - reserve, turn_mult)):
+                fire[counter[0]] = True
             return action
 
         finishes = gun_hit and target.get("hp", math.inf) <= gun[2]["damage"]

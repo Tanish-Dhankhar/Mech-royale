@@ -18,6 +18,6 @@ python3 "$KIT/check/check.py" --map-dir /arena -- \
   --cap-drop ALL -v "$KIT/arena:/arena:ro" mech-royale-final
 ```
 
-Local verification: 14 deterministic scenario tests passed. Under the Docker limits above, the 300-observation official recording and a 300-observation synthetic stress stream (15 visible opponents and 24 crates per observation) each passed with zero deadline misses, stale actions, or stderr output. Candidate p99 was 5.1 ms and 8.1 ms respectively, versus 3.1 ms and 5.9 ms for control `229fa34`.
+Local verification: 18 deterministic scenario tests passed. The official recording and two 300-observation synthetic stress streams (15 opponents with 24 crates, and 24 crates around the changed policy paths) passed under these Docker limits with zero deadline misses, stale actions, invalid output, or stderr. Candidate p99 was 3.9 ms, 4.4 ms, and 3.3 ms respectively.
 
 The conformance checker does not simulate the bot's actions. Practice placement must be measured on the scorer. Publish the **contents of this directory** to a public GitHub repository with `Dockerfile` at its root and submit that URL on the track page. Keep the submitted commit accessible until results are published.
