@@ -374,6 +374,118 @@ class CandidateScenarios(unittest.TestCase):
                 o['self']['pos'] = (5.3, .9, 0.)
                 self.assertGreater(bot.act(o)['move'][1], .5)
 
+    def test_cover_cycle_stages_fires_and_returns_on_two_solid_geometries(self):
+        corner = {'kind': 'building', 'ring': [-4., -9., 5., -9., 0., -19.],
+                  'holes': [], 'base': 0., 'top': 18.}
+        for label, wall, start, enemy, initially_covered in (
+            ('rectangular screen', box(8., 16., -3., 3.), (0., 0.), (56., 0.), True),
+            ('exposed at a triangular corner', corner, (8., 0.), (4., -58.), False),
+        ):
+            with self.subTest(label=label):
+                self.write_map(wall)
+                bot = Bot(self.hello)
+                arena = Arena(self.hello['map']['dir'], self.hello['config']['mech'])
+                x, y = start
+                yaw = math.atan2(enemy[1] - y, enemy[0] - x)
+                aim = (yaw, 0.)
+                contact_yaw = math.atan2(y - enemy[1], x - enemy[0])
+                staged = fired = checked_slew = withdrew_on_cooldown = False
+                shot_at = None
+                for k in range(48):
+                    t = k * .1
+                    # Feed position, actual slew and cooldown observations; this is not a physics replica.
+                    # The target travels parallel to the face of the cover.
+                    fx = enemy[0] + (4. * t if not initially_covered else 0.)
+                    fy = enemy[1] + (4. * t if initially_covered else 0.)
+                    center_line = arena.clear((x, y, 7.), (fx, fy, 4.5))
+                    if k == 0:
+                        self.assertEqual(center_line, not initially_covered)
+                    if not center_line:
+                        if fired:
+                            break
+                        staged = True
+                    misaligned = staged and center_line and not checked_slew
+                    if misaligned:
+                        aim = (yaw + 1.6, 0.)
+                    o = obs_at(t, pos=(x, y, 0.), aim=aim)
+                    o['mechs'] = [foe(4, fx, fy, yaw=contact_yaw,
+                                     vel=(0., 4., 0.) if initially_covered else (4., 0., 0.))]
+                    cooldown = max(0., .45 - t)
+                    if shot_at is not None:
+                        cooldown = max(0., .24 - (t - shot_at))
+                    o['self']['weapons'][0].update(cooldown=cooldown, ammo=12 if shot_at is None else 11)
+                    action = bot.act(o)
+                    self.assertFalse(action['boost'])
+                    self.assertFalse(action['jump'])
+                    if initially_covered and t < .35:
+                        self.assertEqual(action['move'], [0., 0.], 'stage under cover until the weapon is ready')
+                    if shot_at is not None and cooldown > 0.:
+                        self.assertFalse(any(action['fire']))
+                        withdrew_on_cooldown |= math.hypot(*action['move']) > .5
+                    if misaligned:
+                        self.assertFalse(any(action['fire']))
+                        checked_slew = True
+                    if action['fire'][0]:
+                        self.assertTrue(staged and center_line)
+                        self.assertIsNone(shot_at, 'the cycle should withdraw after its trigger')
+                        bearing = math.atan2(fy - y, fx - x)
+                        lead = (action['aim'][0] - bearing + math.pi) % (2 * math.pi) - math.pi
+                        self.assertGreater(lead, .01, 'the trigger must lead the moving target')
+                        shot_at, fired = t, True
+                    delta = (action['aim'][0] - aim[0] + math.pi) % (2 * math.pi) - math.pi
+                    pitch_delta = action['aim'][1] - aim[1]
+                    aim = aim[0] + max(-.4, min(.4, delta)), aim[1] + max(-.3, min(.3, pitch_delta))
+                    mx, my = action['move']
+                    x, y = x + mx, y + my
+                self.assertTrue(staged and checked_slew and fired and withdrew_on_cooldown)
+                self.assertFalse(center_line, 'the trigger must be followed by a covered return')
+
+    def test_cover_cycle_defers_when_no_firing_position_or_walkable_return_exists(self):
+        cage = (box(-5., 5., -5., -4., top=2.), box(-5., 5., 4., 5., top=2.),
+                box(-5., -4., -5., 5., top=2.), box(4., 5., -5., 5., top=2.))
+        for walls, edge_visible in (
+            ((box(8., 18., -38., 38.),), False),
+            ((box(8., 18., -3., 3.), *cage), True),
+        ):
+            with self.subTest(edge_visible=edge_visible):
+                self.write_map(*walls)
+                arena = Arena(self.hello['map']['dir'], self.hello['config']['mech'])
+                self.assertEqual(arena.clear((0., 8., 7.), (56., 0., 4.5)), edge_visible)
+                o = obs_at(4.)
+                idle = Bot(self.hello).act(o)
+                o['mechs'] = [foe(4, 56., 0.)]
+                action = Bot(self.hello).act(o)
+                self.assertFalse(any(action['fire']))
+                self.assertFalse(action['boost'] or action['jump'])
+                self.assertEqual(action['move'], idle['move'])
+
+    def test_cover_cycle_vetoes_crossfire_rush_and_shrink_during_outbound(self):
+        self.write_map(box(8., 16., -3., 3.))
+        for hazard in ('second line', 'closing mech', 'closing circle'):
+            with self.subTest(hazard=hazard):
+                bot = Bot(self.hello)
+                o = obs_at()
+                o['mechs'] = [foe(4, 56., 0.)]
+                first = bot.act(o)
+                dx, dy = first['move']
+                self.assertGreater(abs(dy), .5)
+                pos = (5. * dx, 5. * dy, 0.)
+                o = obs_at(.5, pos=pos, aim=first['aim'])
+                o['mechs'] = [foe(4, 56., 0.)]
+                if hazard == 'second line':
+                    o['mechs'].append(foe(5, 145., pos[1], yaw=math.pi))
+                elif hazard == 'closing mech':
+                    o['mechs'][0] = foe(4, 27., 0., vel=(-18., 0., 0.))
+                else:
+                    o['zone'].update(next_center=[-37., 0.], next_radius=23.,
+                                     shrink_start=.5, shrink_end=1.4)
+                action = bot.act(o)
+                self.assertFalse(any(action['fire']))
+                if hazard == 'closing circle':
+                    self.assertLess(action['move'][0], -.5)
+                else:
+                    self.assertLess(action['move'][0] * dx + action['move'][1] * dy, -.5)
+
     def test_urgent_duel_shorts_charging_laser_without_turning(self):
         for rotation in (False, True):
             source = (4., 3.) if rotation else (27., 0.)

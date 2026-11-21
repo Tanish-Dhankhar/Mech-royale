@@ -46,6 +46,16 @@ class Intent:
     def key(self):
         return self.kind, self.item['id'] if self.item is not None else None
 
+@dataclass(slots=True)
+class CoverRun:
+    foe: dict
+    home: tuple
+    edge: tuple
+    phase: str
+    since: float
+    until: float
+    laser: bool = False
+
 
 class Bot:
     name = 'Cutline'
@@ -72,6 +82,8 @@ class Bot:
         self.drop_abort = {}
         self.scan_marks = {}
         self.pursuit = None
+        self.cover_run = self.cover_history = None
+        self.cover_retry = 0.
         self.flanked_at = float('-inf')
         self.shot_at = float('-inf')
         self.shot_target = None
@@ -122,17 +134,23 @@ class Bot:
         if interrupt and boost:
             drain = 'boost_drain' if self.me['grounded'] and not jump else 'jet_drain'
             reserve += self.stats[drain] * self.weapons.window
-        action = self.weapons.act(obs, target, urgent=urgent, reserve=reserve, aim=aim, interrupt=interrupt)
+        # An automatic top-off must not lock the gun just as it steps out.
+        on_cover_leg = self.intent.kind == 'cover' and self.cover_run.phase in ('stage', 'out', 'return')
+        action = self.weapons.act(obs, target, urgent=urgent or on_cover_leg, reserve=reserve, aim=aim,
+                                  interrupt=interrupt)
         action.update(tick=obs['tick'], move=move, boost=boost, jump=jump)
-        # A defensive lightning interrupt is not a pursuit cue.
-        if target and any(
+        if self.intent.kind == 'cover':
+            if target is not None:
+                self._cover_trigger(action['fire'])
+        # A defensive lightning interrupt or a cover burst is not a pursuit cue.
+        elif target and any(
                 w and (not f and w.get('charge', 0.) > 0. if w['kind'] == 'laser'
                        else f and not (interrupt and w['kind'] == 'lightning'))
                 for w, f in zip(self.me['weapons'], action['fire'])):
             self.shot_target, self.shot_at, self.shot_origin = target, self.t, self.p
         self._equip(action, critical)
         if (target is None and not critical and not self.pinched and obs['alive'] > 1
-                and self.intent.kind not in ('heal', 'flank') and 'drop' not in action):
+                and self.intent.kind not in ('heal', 'flank', 'cover') and 'drop' not in action):
             foe = self._defensive_target()
             if foe is not None:
                 # Use the gun-only controller path; don't steer or remember a missed shot.
@@ -176,12 +194,12 @@ class Bot:
         self.route_fail = {k: v for k, v in self.route_fail.items() if v > self.t}
         self.drop_abort = {k: v for k, v in self.drop_abort.items() if v > self.t}
 
-    def _line(self, source, p):
+    def _line(self, source, p, *, body_height=.57):
         if source['kind'] == 'npc':
             height = 2.5
         else:
             height = self.cfg['mech']['muzzle_height'] * (1 + self.cfg['cubes']['size_per_cube'] * source.get('cubes', 0))
-        return self.arena.clear(above(source['pos'], height), above(p, self.h * .57))
+        return self.arena.clear(above(source['pos'], height), above(p, self.h * body_height))
 
     def _lines(self, p, horizon):
         key = (*p, round(horizon, 1))
@@ -642,11 +660,25 @@ class Bot:
         if old and old.roof and self.climbing and not (self.rush or self.unsafe):
             return
         if self.pinched:
+            self.cover_run = None
             self.intent = self._route_intent('rotate', self._anchor('rotate'))
             return
         if self.unsafe:
+            run = self.cover_run
+            if run and not self.rush:
+                run.foe = next((e for e in self.enemies if e['id'] == run.foe['id']), run.foe)
+                if self._cover_home_safe(run) and (run.phase != 'return' or self.t < run.until):
+                    self._cover_return(run)
+                    return
+            self.cover_run = None
+            self.cover_retry = self.t + .65
             self.intent = self._escape_intent()
             return
+        if self.cover_run:
+            if self.rush:
+                self.cover_run = None
+            elif self._follow_cover():
+                return
         if old and old.kind == 'pursue' and self.pursuit and self.t < self.pursuit[1]:
             if distance(self.p, old.p) > 2. and self.stalled < 1.2 and self.zone.margin(old.p, 3.) >= 0:
                 return
@@ -672,6 +704,8 @@ class Bot:
             return
         if duel and self.main and not ahead and self._advantage(self.main) < -.12:
             self.intent = self._route_intent('reangle', self._anchor('duel'))
+            return
+        if self._start_cover():
             return
         if late or duel:
             self.intent = self._route_intent('hold', self._anchor('hold'))
@@ -722,6 +756,264 @@ class Bot:
             return candidate
         return None
 
+    def _cover_center(self, foe, lead=0.):
+        x, y, z = foe['pos']
+        vx, vy, vz = foe.get('vel', (0., 0., 0.))
+        height = self.cfg['mech']['height'] * (1 + self.cfg['cubes']['size_per_cube'] * foe.get('cubes', 0))
+        return x + vx * lead, y + vy * lead, z + vz * lead + height * .5
+
+    def _cover_ray(self, p, foe, lead=0.):
+        return self.arena.clear(above(p, self.stats['muzzle_height']), self._cover_center(foe, lead))
+
+    def _cover_occluded(self, p, foe):
+        # No favorable facing, distance, or foliage can substitute for solid occlusion.
+        return (not self._line(foe, p) and not self._line(foe, p, body_height=.85)
+                and not self._cover_ray(p, foe))
+
+    def _cover_aim(self, foe):
+        x, y, z = self._cover_center(foe, self.weapons.window)
+        dx, dy = x - self.p[0], y - self.p[1]
+        return atan2(dy, dx), atan2(z - self.p[2] - self.stats['muzzle_height'], hypot(dx, dy))
+
+    def _cover_crossfire(self, p, target):
+        if any(e['id'] != target for e in self._lines(p, .45)):
+            return True
+        # _lines is the placement threat model, not a cap on hostile weapon reach.
+        for foe in self.enemies:
+            if foe['id'] == target:
+                continue
+            d = distance(foe['pos'], p)
+            if d <= 115. or (foe['id'] not in self.attackers
+                             and turn(foe['aim'][0], angle(foe['pos'], p)) >= 1.15):
+                continue
+            if any(d <= (self.mortar_reach if k == 'mortar' else self.direct_threat_reach.get(k, 0.))
+                   for k in foe.get('weapons', ())) and self._line(foe, p):
+                return True
+        return False
+
+    def _cover_rushed(self, p, foe):
+        dx, dy = p[0] - foe['pos'][0], p[1] - foe['pos'][1]
+        d = hypot(dx, dy)
+        vx, vy, _ = foe.get('vel', (0., 0., 0.))
+        closing = (dx * vx + dy * vy) / max(1., d)
+        return d < 22. or (closing > 4. and d - closing * 1.6 < 22.)
+
+    def _cover_wait(self, p, foe):
+        x, y, z = self._cover_center(foe)
+        d = hypot(x - p[0], y - p[1], z - p[2] - self.stats['muzzle_height'])
+        wait = float('inf')
+        for w in self.me['weapons']:
+            if not w:
+                continue
+            stats, kind, cooldown = w['stats'], w['kind'], w['cooldown']
+            reach = stats['range'] if kind != 'mortar' else stats['speed'] ** 2 / stats['gravity']
+            if d >= reach:
+                continue
+            if kind == 'gun':
+                reload = w.get('reload', 0.)
+                if w.get('ammo', 0) <= 0 and not reload:
+                    continue
+                cooldown = max(cooldown, reload)
+            elif kind == 'laser':
+                if self.t < self.weapons.short_until:
+                    continue
+            elif kind == 'lightning' and self.me['energy'] - self.reserve < stats['energy']:
+                continue
+            wait = min(wait, cooldown)
+        return wait
+
+    def _cover_lane(self, a, b, target, deadline):
+        if perf_counter() >= deadline:
+            return False
+        steps = max(1, ceil(distance(a, b) / 3.5))
+        for i in range(1, steps):
+            if perf_counter() >= deadline:
+                return False
+            f = i / steps
+            p = (a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f)
+            if self._cover_crossfire(p, target):
+                return False
+        return True
+
+    def _find_cover_pair(self, foe, exposed):
+        # Only use a short, reversible walking leg; don't spend navigation searches on a peek.
+        deadline = min(self.stop_work, perf_counter() + .0035)
+        target = foe['id']
+        yaw = angle(self.p, foe['pos'])
+        previous = self.cover_history
+        if previous and (previous[0] != target or self.t - previous[2] > 8.):
+            previous = None
+        same_edge = None
+        for reach in (6., 10., 14.):
+            for i in (2, -2, 3, -3, 1, -1, 4, -4, 0, 5, -5, 6):
+                if perf_counter() >= deadline:
+                    return same_edge
+                q = self._ground(offset(self.p, yaw + i * pi / 6, reach))
+                home, edge = (q, self.p) if exposed else (self.p, q)
+                wait = self._cover_wait(edge, foe)
+                if wait > 1.8 or self._cover_rushed(edge, foe):
+                    continue
+                # Include staging, both walking legs, a burst and some settling time.
+                horizon = max(wait, reach / self.speed if exposed else 0.) + 2. * reach / self.speed + 2.
+                if min(self.zone.margin(home, horizon), self.zone.margin(edge, horizon)) < self.r + 1.:
+                    continue
+                if not self.arena.fits(q, self.r, self.h):
+                    continue
+                if exposed:
+                    inside_home = self._ground(offset(home, angle(home, edge), 1.))
+                    if not self._cover_occluded(home, foe) or not self._cover_occluded(inside_home, foe):
+                        continue
+                elif not self._cover_ray(edge, foe):
+                    continue
+                # The walking controller stops short of the exact waypoint.
+                inside = self._ground(offset(edge, angle(edge, home), 1.))
+                if (not self._cover_ray(inside, foe, .25) or self._cover_crossfire(q, target)
+                        or not self._walk(home, edge) or not self._walk(edge, home)
+                        or not self._cover_lane(home, edge, target, deadline)):
+                    continue
+                if previous is None or distance(previous[1], edge) >= max(5., self.r * 2):
+                    return home, edge
+                if same_edge is None:
+                    same_edge = home, edge
+        return same_edge
+
+    def _start_cover(self):
+        if (self.rush or self.obs['alive'] <= 1 or not self.me['grounded'] or not self.enemies
+                or self.t < self.cover_retry or any(w and w.get('charge', 0.) for w in self.me['weapons'])):
+            return False
+        self.cover_retry = self.t + .55
+        exposed = len(self.dangers) == 1
+        if exposed:
+            foe = self.main
+            if not foe or foe['kind'] != 'mech':
+                return False
+        else:
+            if self.dangers:
+                return False
+            foe = min(self.enemies, key=lambda e: (e['id'] not in self.attackers, distance(self.p, e['pos'])))
+        if (distance(self.p, foe['pos']) > 112. or self._cover_rushed(self.p, foe)
+                or not (self._cover_ray(self.p, foe) if exposed else self._cover_occluded(self.p, foe))
+                or self._cover_crossfire(self.p, foe['id'])):
+            return False
+        pair = self._find_cover_pair(foe, exposed)
+        if pair is None:
+            return False
+        home, edge = pair
+        self.cover_run = CoverRun(foe, home, edge, 'stage', self.t, self.t + 2.1 + distance(self.p, home) / self.speed)
+        return self._follow_cover()
+
+    def _cover_home_safe(self, run):
+        back = distance(self.p, run.home)
+        return (self.me['grounded'] and back < 16.
+                and min(self.zone.margin(run.home), self.zone.margin(run.home, back / self.speed * 1.5 + 1.)) >= self.r
+                and self._cover_occluded(run.home, run.foe)
+                and not self._cover_crossfire(run.home, run.foe['id'])
+                and self._walk(self.p, run.home))
+
+    def _cover_phase(self, run, phase, seconds):
+        run.phase, run.since, run.until = phase, self.t, self.t + seconds
+
+    def _cover_return(self, run):
+        if run.phase != 'return':
+            if run.phase in ('out', 'fire'):
+                self.cover_history = run.foe['id'], run.edge, self.t
+            self._cover_phase(run, 'return', .65 + 1.65 * distance(self.p, run.home) / self.speed)
+        self.intent = Intent('cover', run.home)
+        return True
+
+    def _cover_abort(self, escape=False):
+        self.cover_run = None
+        self.cover_retry = self.t + .7
+        if escape:
+            self.intent = self._escape_intent()
+        return escape
+
+    def _follow_cover(self):
+        run = self.cover_run
+        target = run.foe['id']
+        foe = next((e for e in self.enemies if e['id'] == target), None)
+        if foe is not None:
+            run.foe = foe
+        back = distance(self.p, run.home)
+        if not self._cover_home_safe(run):
+            return self._cover_abort(escape=bool(self.dangers) or self._cover_crossfire(self.p, target))
+        if run.phase == 'return':
+            if back <= .8 and self._cover_occluded(self.p, run.foe):
+                self._cover_phase(run, 'reset', .35)
+            elif (back <= .65 or self.t >= run.until
+                  or (self.t - run.since > .65 and self.stalled > .65)):
+                return self._cover_abort(escape=bool(self.dangers) or self._cover_crossfire(self.p, target))
+            else:
+                return self._cover_return(run)
+        if run.phase == 'reset':
+            if back > .8 or not self._cover_occluded(self.p, run.foe):
+                return self._cover_return(run)
+            if self.t >= run.until or foe is None or self._cover_rushed(run.home, foe):
+                self.cover_run = None
+                return False
+            self.intent = Intent('cover', run.home)
+            return True
+        if (foe is None or any(self._cover_rushed(p, foe) for p in (self.p, run.edge, run.home))
+                or self._cover_crossfire(self.p, target)):
+            return self._cover_return(run)
+        if self.t >= run.until:
+            return self._cover_return(run) if run.phase != 'stage' else self._cover_abort()
+
+        walk = distance(self.p, run.edge)
+        loop = (walk + distance(run.edge, run.home)) / self.speed
+        if (min(self.zone.margin(run.edge, loop + 2.), self.zone.margin(run.home, loop + 2.)) < self.r + 1.
+                or not self._cover_ray(run.edge, foe, .25) or self._cover_crossfire(run.edge, target)
+                or not self._walk(run.edge, run.home)
+                or not self._cover_lane(run.home, run.edge, target, self.stop_work)):
+            return self._cover_return(run)
+        if run.phase == 'stage':
+            if back > .8:
+                if self.t - run.since > .65 and self.stalled > .65:
+                    return self._cover_abort(escape=bool(self.dangers))
+            elif self._cover_occluded(self.p, foe):
+                yaw, pitch = self._cover_aim(foe)
+                if (self._cover_wait(run.edge, foe) <= self.weapons.window + 1e-8
+                        and turn(self.me['aim'][0], yaw) < .48 and abs(self.me['aim'][1] - pitch) < .3):
+                    self._cover_phase(run, 'out', .55 + 1.55 * walk / self.speed)
+            elif back <= .65:
+                return self._cover_abort(escape=bool(self.dangers))
+            if run.phase == 'stage':
+                self.intent = Intent('cover', run.home)
+                return True
+        if run.phase == 'out':
+            if walk <= .8 and self._cover_ray(self.p, foe):
+                self._cover_phase(run, 'fire', .6)
+            elif (not self._walk(self.p, run.edge) or (self.t - run.since > .65 and self.stalled > .65)
+                  or not self._cover_lane(self.p, run.edge, target, self.stop_work)):
+                return self._cover_return(run)
+            else:
+                self.intent = Intent('cover', run.edge)
+                return True
+        laser = next((w for w in self.me['weapons'] if w and w['kind'] == 'laser'), None)
+        if ((run.laser and laser and laser['cooldown'] > self.weapons.window and not laser.get('charge', 0.))
+                or (not (laser and laser.get('charge', 0.)) and self._cover_wait(self.p, foe) > self.weapons.window + 1e-8)
+                or not self._cover_ray(self.p, foe)):
+            return self._cover_return(run)
+        self.intent = Intent('cover', self.p)
+        return True
+
+    def _cover_trigger(self, fire):
+        run = self.cover_run
+        instant = charging = False
+        for w, trigger in zip(self.me['weapons'], fire):
+            if not w:
+                continue
+            if w['kind'] == 'laser':
+                charging = trigger or bool(w.get('charge', 0.))
+                if trigger and not run.laser:
+                    run.laser = True
+                    run.until = min(run.since + 1.25, self.t + w['stats']['charge'] + .2)
+            else:
+                instant |= trigger
+        # A laser trigger is only a charge; cooldown in the next observation confirms its release.
+        if instant and not charging:
+            self._cover_return(run)
+
     def _commit_flank(self):
         if self.intent and self.intent.kind == 'flank' and self.t - self.flanked_at < 2.8:
             if self.stalled < 1.4 and len(self.dangers) < 2 and self.zone.margin(self.intent.p, 4.) > 0:
@@ -750,6 +1042,9 @@ class Bot:
 
     def _target(self, duel, ahead):
         g = self.intent
+        if g.kind == 'cover':
+            run = self.cover_run
+            return self._cover_aim(run.foe), run.foe if run.phase == 'fire' else None
         loud = next((s for s in self.obs['sounds'] if s['kind'] in ('laser_charge', 'boost', 'lightning', 'jet', 'gun') and s['dist'] == 'near'), None)
         if self.main:
             fallback = angle(self.p, self.main['pos']), 0.
@@ -870,12 +1165,12 @@ class Bot:
                 return direction(self.p, landing), False, False
         if g.kind == 'drop' and distance(self.p, g.p) < 1.15:
             base = [0., 0.]
-        elif distance(self.p, target_point) < .9:
+        elif distance(self.p, target_point) < (.65 if g.kind == 'cover' else .9):
             base = [0., 0.]
         else:
             base = direction(self.p, target_point)
         room = self.me['energy'] - self.reserve
-        boost = self.me['grounded'] and hypot(*base) > .7 and (
+        boost = g.kind != 'cover' and self.me['grounded'] and hypot(*base) > .7 and (
             critical and self.me['energy'] > (3. if self.rush else 10.)
             or room > 18. and (g.kind == 'rotate' or g.kind in ('cubes', 'pickups', 'drop') and distance(self.p, g.p) > 24.)
         )
@@ -898,6 +1193,11 @@ class Bot:
                 break
             v = [cos(a), sin(a)]
             q = step(v)
+            if g.kind == 'cover':
+                run = self.cover_run
+                if (not self._walk(q, run.home) or self._cover_crossfire(q, run.foe['id'])
+                        or run.phase in ('reset', 'stage') and not self._cover_occluded(q, run.foe)):
+                    continue
             if self._walk(self.p, q) and (g.kind != 'drop' or distance(q, g.item['pos']) < g.item['radius'] - .3):
                 options.append((v, q, self._projectile_risk(v) if bad else 0.))
         if not options:
