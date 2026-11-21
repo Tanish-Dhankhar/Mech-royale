@@ -50,6 +50,13 @@ def foe(ident, x, y, *, hp=900., yaw=math.pi, vel=(0., 0., 0.), charging=False):
             'aim': [yaw, 0.], 'hp': hp, 'max_hp': 1400., 'weapons': ['gun'], 'charging': charging}
 
 
+def defensive_obs(t=0.):
+    o = obs_at(t, pos=(-77., 0., 0.), aim=(0., -.02))
+    o['zone'].update(radius=158., next_radius=145.)
+    o['mechs'] = [foe(4, 51., 0., vel=(-7., 0., 0.))]
+    return o
+
+
 class CandidateScenarios(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -200,6 +207,107 @@ class CandidateScenarios(unittest.TestCase):
         o['self']['aim'] = first['aim']
         o['t'], o['tick'] = 308.1, 6162
         self.assertTrue(bot.act(o)['fire'][0])
+
+    def test_defensive_gun_fires_while_moving_toward_loot(self):
+        self.write_map()
+        o = defensive_obs()
+        o['self']['weapons'][1] = weapon('laser')
+        o['cubes'] = [{'id': 5000, 'pos': [-77., 13., 0.]}]
+        action = Bot(self.hello).act(o)
+        self.assertEqual(action['fire'], [True, False])
+        self.assertGreater(action['move'][1], .9)
+        self.assertNotIn('reload', action)
+
+    def test_defensive_gun_fires_on_aligned_charge_without_closing(self):
+        self.write_map()
+        o = defensive_obs()
+        actor = foe(7, 78., 0., charging=True)
+        actor['weapons'] = ['laser']
+        o['mechs'] = [actor]
+        self.assertEqual(Bot(self.hello).act(o)['fire'], [True, False])
+
+    def test_defensive_gun_respects_threat_and_readiness_vetoes(self):
+        self.write_map()
+        for label in ('turned away', 'retreating', 'stationary', 'unknown loadout',
+                      'bad aim', 'cooldown', 'reload', 'empty', 'unknown ammo', 'short live range',
+                      'own laser charging', 'second line', 'second line beyond 160',
+                      'urgent shrink', 'healing'):
+            with self.subTest(label=label):
+                o = defensive_obs()
+                actor, = o['mechs']
+                own = o['self']
+                gun = own['weapons'][0]
+                if label == 'turned away':
+                    actor['aim'][0] = 0.
+                elif label == 'retreating':
+                    actor['vel'] = [7., 0., 0.]
+                elif label == 'stationary':
+                    actor['vel'] = [0., 0., 0.]
+                elif label == 'unknown loadout':
+                    actor['weapons'] = []
+                elif label == 'bad aim':
+                    own['aim'][0] = 1.
+                elif label == 'cooldown':
+                    gun['cooldown'] = .14
+                elif label == 'reload':
+                    gun['reload'] = 1.
+                elif label == 'empty':
+                    gun['ammo'] = 0
+                elif label == 'unknown ammo':
+                    del gun['ammo']
+                elif label == 'short live range':
+                    gun['stats'] = {**gun['stats'], 'range': 90.}
+                elif label == 'own laser charging':
+                    own['weapons'][1] = weapon('laser', charge=.6)
+                elif label in ('second line', 'second line beyond 160'):
+                    x = 20. if label == 'second line' else 83.
+                    o['mechs'].append(foe(5, x, 35., yaw=math.atan2(-35., -77. - x)))
+                elif label == 'urgent shrink':
+                    o['zone'].update(next_radius=35., shrink_start=0., shrink_end=2.)
+                elif label == 'healing':
+                    own['hp'] = 1030.
+                    o['events'] = [{'type': 'damaged', 'weapon': 'zone', 'amount': 20}]
+                self.assertEqual(Bot(self.hello).act(o)['fire'], [False, False])
+
+    def test_defensive_gun_keeps_cover_and_retreat_priorities(self):
+        self.write_map(box(-2., 2., -5., 5.))
+        self.assertFalse(Bot(self.hello).act(defensive_obs())['fire'][0])
+        self.write_map()
+        bot = Bot(self.hello)
+        o = defensive_obs()
+        o['self']['hp'] = 500.
+        o['mechs'][0]['pos'][0] = -12.
+        o['events'] = [{'type': 'damaged', 'weapon': 'gun', 'amount': 45, 'by': 4, 'bearing': 0.}]
+        self.assertLess(bot.act(o)['move'][0], -.5)
+        later = defensive_obs(.1)
+        later['self']['hp'] = 500.
+        action = bot.act(later)
+        self.assertFalse(action['fire'][0])
+        self.assertLess(action['move'][0], -.5)
+
+    def test_defensive_gun_does_not_hijack_later_loot(self):
+        self.write_map(box(-2., 2., 1., 6.))
+        bot = Bot(self.hello)
+        o = defensive_obs()
+        o['pickups'] = [{'id': 8000, 'kind': 'laser', 'pos': [-77., 15., 0.]}]
+        self.assertEqual(bot.act(o)['fire'], [True, False])
+
+        later = defensive_obs(.8)
+        later['self']['pos'] = [-77., 9., 0.]
+        later['pickups'] = o['pickups']
+        action = bot.act(later)
+        self.assertEqual(action['fire'], [False, False])
+        self.assertGreater(action['move'][1], .9)
+
+        arrival = defensive_obs(1.4)
+        arrival['self']['pos'] = [-77., 15., 0.]
+        arrival['self']['weapons'][1] = weapon('mortar')
+        arrival['pickups'] = o['pickups']
+        arrival['mechs'][0]['pos'][1] = 15.
+        action = bot.act(arrival)
+        self.assertEqual(action['take'], 8000)
+        self.assertEqual(action['drop'], 1)
+        self.assertEqual(action['fire'], [False, False])
 
     def test_zero_radius_and_skipped_ticks_choose_inward(self):
         self.write_map()

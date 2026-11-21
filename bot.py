@@ -53,6 +53,10 @@ class Bot:
         self.cfg = hello['config']
         self.arena = Arena(hello['map']['dir'], self.cfg['mech'])
         self.weapons = Weapons(self.cfg, self.arena)
+        self.direct_threat_reach = {kind: rules['range'] for kind, rules in self.weapons.rules.items()
+                                    if kind != 'mortar'}
+        mortar = self.weapons.rules['mortar']
+        self.mortar_reach = mortar['speed'] ** 2 / mortar['gravity'] + mortar['splash_radius']
         self.upgrades = {u['id']: u['effects'] for u in self.cfg['upgrades']}
         self.items = {}
         self.attackers = {}
@@ -117,6 +121,15 @@ class Bot:
                           for w, f in zip(self.me['weapons'], action['fire'])):
             self.shot_target, self.shot_at, self.shot_origin = target, self.t, self.p
         self._equip(action, critical)
+        if (target is None and not critical and not self.pinched and obs['alive'] > 1
+                and self.intent.kind not in ('heal', 'flank') and 'drop' not in action):
+            foe = self._defensive_target()
+            if foe is not None:
+                # Use the gun-only controller path; don't steer or remember a missed shot.
+                shot = self.weapons.act(obs, foe, urgent=True, reserve=self.reserve, aim=aim)
+                if shot['fire'][0]:
+                    action.update(shot)
+                    action.pop('reload', None)
         if obs['offer']:
             action['pick'] = self._pick(obs['offer'])
         return action
@@ -585,6 +598,44 @@ class Bot:
     def _shot_line(self, actor):
         height = (2.0 if actor.get('kind') == 'npc' else .9 if actor['id'] >= 1000 else 4.5)
         return self.arena.clear(above(self.p, self.stats['muzzle_height']), above(actor['pos'], height))
+
+    def _defensive_target(self):
+        gun, secondary = self.me['weapons']
+        if (not self.enemies or not gun or gun['kind'] != 'gun' or gun.get('ammo', 0) <= 0
+                or gun.get('reload', 0.) > 0 or gun['cooldown'] > self.weapons.window + 1e-8
+                or (secondary and secondary.get('charge', 0.) > 0.)):
+            return None
+
+        line, candidate = None, None
+        x, y, z = above(self.p, self.h * .57)
+        muzzle = self.cfg['mech']['muzzle_height']
+        size = self.cfg['cubes']['size_per_cube']
+        for foe in self.enemies:
+            fx, fy, fz = foe['pos']
+            dx, dy = x - fx, y - fy
+            d = hypot(dx, dy)
+            yaw, pitch = foe['aim']
+            if turn(yaw, atan2(dy, dx)) > pi / 12:
+                continue
+            kinds = foe.get('weapons', ())
+            origin = fx, fy, fz + muzzle * (1. + size * foe.get('cubes', 0))
+            direct = (abs(pitch - atan2(z - origin[2], d)) <= pi / 12
+                      and any(d <= self.direct_threat_reach.get(kind, 0.) for kind in kinds))
+            # Veto crossfire at the other weapon's range, not our engagement cap.
+            if not direct and not ('mortar' in kinds and d <= self.mortar_reach):
+                continue
+            if not self.arena.clear(origin, (x, y, z)):
+                continue
+            if line is not None:
+                return None
+            line = foe
+            vx, vy, _ = foe['vel']
+            if (direct and 120. <= d < 160.
+                    and (vx * dx + vy * dy >= 4. * d or (foe.get('charging') and 'laser' in kinds))):
+                candidate = foe
+        if candidate is not None and (not self.dangers or self.dangers[0]['id'] == candidate['id']):
+            return candidate
+        return None
 
     def _commit_flank(self):
         if self.intent and self.intent.kind == 'flank' and self.t - self.flanked_at < 2.8:
